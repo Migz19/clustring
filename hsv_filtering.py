@@ -10,7 +10,7 @@ def parse_yolo_labels(file_path):
             parts = list(map(float, line.split()))
 
             cls, x1, x2, y1, y2 = parts
-            if cls == 1 or cls == 2:
+            if cls==1 or cls==2 or cls==5:
                 bounding_boxes.append([cls, x1, x2, y1, y2])
     return bounding_boxes
 
@@ -81,8 +81,6 @@ def apply_masking(crop):
 
 
 def extract_dominant_colors(crop, n_colors=2):
-
-
     pixels = apply_masking(crop)
     if len(pixels) < 10:  # If still too few pixels
         # Take center portion of crop
@@ -170,9 +168,14 @@ def extract_player_colors(image, bounding_boxes):
     return player_colors
 
 
-def classify_players_by_color(player_colors, n_teams=2):
+def classify_players_by_color(player_colors, n_teams=2, referee_threshold=0.01):
     """
-    Classify players using both dominant colors.
+    Classify players using both dominant colors, with referee detection.
+
+    Args:
+        player_colors: List of color pairs and bounding boxes
+        n_teams: Number of teams (default 2)
+        referee_threshold: Distance threshold to identify referees
     """
     # Extract primary colors for clustering
     primary_colors = np.array([color_pair[0][0] for color_pair in player_colors])
@@ -184,54 +187,74 @@ def classify_players_by_color(player_colors, n_teams=2):
     # Normalize features
     color_features = color_features / 255.0
 
-    # Perform clustering
+    # Perform clustering for teams
     kmeans = KMeans(n_clusters=n_teams, random_state=20, n_init=10)
     labels = kmeans.fit_predict(color_features)
 
-    return labels
+    # Get cluster centers
+    team_centers = kmeans.cluster_centers_
+
+    # Calculate distances to cluster centers for each player
+    distances = np.zeros((len(color_features), n_teams))
+    for i in range(n_teams):
+        distances[:, i] = np.linalg.norm(color_features - team_centers[i], axis=1)
+
+    # Find minimum distance to any team cluster
+    min_distances = np.min(distances, axis=1)
+
+    # Mark players as referees if they're too far from both team clusters
+    referee_mask = min_distances > referee_threshold
+
+    # Create final labels: teams are 0 and 1, referee is 2
+    final_labels = labels.copy()
+    final_labels[referee_mask] = 2
+
+    return final_labels
 
 
 def calculate_clustering_accuracy(predicted_labels, true_labels):
     """
-    Calculate clustering accuracy considering possible label permutations.
+    Calculate clustering accuracy considering possible label permutations and referees.
 
     Args:
-        predicted_labels (numpy.ndarray): Labels from clustering (0 or 1)
-        true_labels (numpy.ndarray): Ground truth labels from YOLO file (1 or 2)
-
-    Returns:
-        float: Best accuracy score
-        dict: Confusion matrix
+        predicted_labels (numpy.ndarray): Labels from clustering (0, 1, or 2 for referee)
+        true_labels (numpy.ndarray): Ground truth labels from YOLO file
     """
-    # Convert true labels from (1,2) to (0,1) format
-    true_labels = true_labels - 1
+    # Handle only team labels for accuracy calculation
+    team_mask = predicted_labels != 2
+    if not any(team_mask):
+        return 0.0, {'true_positive': 0, 'true_negative': 0,
+                     'false_positive': 0, 'false_negative': 0}
 
-    # Try both possible label mappings (clustering might flip labels)
-    accuracy1 = np.mean(predicted_labels == true_labels)
-    accuracy2 = np.mean(predicted_labels == (1 - true_labels))
+    team_predictions = predicted_labels[team_mask]
+    team_true_labels = true_labels[team_mask] - 1  # Convert from 1,2 to 0,1
+
+    # Try both possible label mappings
+    accuracy1 = np.mean(team_predictions == team_true_labels)
+    accuracy2 = np.mean(team_predictions == (1 - team_true_labels))
 
     best_accuracy = max(accuracy1, accuracy2)
 
     # Use the best mapping for confusion matrix
     if accuracy1 >= accuracy2:
-        final_predictions = predicted_labels
+        final_predictions = team_predictions
     else:
-        final_predictions = 1 - predicted_labels
+        final_predictions = 1 - team_predictions
 
     # Calculate confusion matrix
     confusion_matrix = {
-        'true_positive': np.sum((final_predictions == 1) & (true_labels == 1)),
-        'true_negative': np.sum((final_predictions == 0) & (true_labels == 0)),
-        'false_positive': np.sum((final_predictions == 1) & (true_labels == 0)),
-        'false_negative': np.sum((final_predictions == 0) & (true_labels == 1))
+        'true_positive': np.sum((final_predictions == 1) & (team_true_labels == 1)),
+        'true_negative': np.sum((final_predictions == 0) & (team_true_labels == 0)),
+        'false_positive': np.sum((final_predictions == 1) & (team_true_labels == 0)),
+        'false_negative': np.sum((final_predictions == 0) & (team_true_labels == 1))
     }
 
     return best_accuracy, confusion_matrix
 
 
 def main():
-    image_path = '17.png'
-    labels_path = '17.txt'
+    image_path = '15.png'
+    labels_path = '15.txt'
 
     # Load and process image
     original_image = cv2.imread(image_path)
@@ -240,21 +263,28 @@ def main():
     bounding_boxes = parse_yolo_labels(labels_path)
     player_colors = extract_player_colors(original_image, bounding_boxes)
 
-    # Classify players
-    team_labels = classify_players_by_color(player_colors)
+    # Classify players with referee detection
+    team_labels = classify_players_by_color(player_colors, referee_threshold=0.3)
     true_labels = np.array([box[0] for box in bounding_boxes])
+
     # Visualize results
     vis_image = original_image.copy()
     TEAM1_COLOR = (0, 0, 255)  # Red in BGR
     TEAM2_COLOR = (255, 0, 0)  # Blue in BGR
+    REFEREE_COLOR = (0, 255, 0)  # Green in BGR
 
     for (colors, box), team_label in zip(player_colors, team_labels):
         cls, x1, x2, y1, y2 = box
 
         # Choose color based on team label
-        box_color = TEAM1_COLOR if team_label == 0 else TEAM2_COLOR
+        if team_label == 2:  # Referee
+            box_color = REFEREE_COLOR
+            label_text = "REF"
+        else:
+            box_color = TEAM1_COLOR if team_label == 0 else TEAM2_COLOR
+            label_text = f"T {team_label + 1}"
 
-        # Draw bounding box with fixed team color
+        # Draw bounding box
         cv2.rectangle(vis_image, (int(x1), int(y1)), (int(x2), int(y2)),
                       box_color, 2)
 
@@ -266,21 +296,22 @@ def main():
         # Draw patches for both colors
         for i, color in enumerate(colors):
             patch_x = int(x1) + (i * patch_width)
-            if y_offset > 0:  # Ensure we're not drawing outside the image
+            if y_offset > 0:
                 cv2.rectangle(vis_image,
                               (patch_x, y_offset),
                               (patch_x + patch_width, y_offset + patch_height),
                               color, -1)
 
-        # Add team label with fixed team color
-        label_text = f"T {team_label + 1}"
+        # Add label
         cv2.putText(vis_image, label_text,
                     (int(x1), int(y1) - patch_height - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+
     accuracy, confusion_matrix = calculate_clustering_accuracy(team_labels, true_labels)
 
     print("\nClustering Performance Metrics:")
     print(f"Overall Accuracy: {accuracy * 100:.2f}%")
+
     # Display results
     cv2.imshow('Team Classification with Colors', vis_image)
     cv2.waitKey(0)
@@ -289,3 +320,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
