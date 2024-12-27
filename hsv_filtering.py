@@ -10,23 +10,17 @@ def parse_yolo_labels(file_path):
             parts = list(map(float, line.split()))
 
             cls, x1, x2, y1, y2 = parts
-            if cls ==1 or cls == 2 or cls==5:
+            if cls == 1 or cls == 2 or cls == 5:
                 bounding_boxes.append([cls, x1, x2, y1, y2])
     return bounding_boxes
 
 
 def calculate_color_distance(color1, color2):
-    """
-    Calculate color distance using a combination of RGB and HSV spaces
-    """
-    # Convert to HSV
     hsv1 = cv2.cvtColor(np.uint8([[color1]]), cv2.COLOR_BGR2HSV)[0][0]
     hsv2 = cv2.cvtColor(np.uint8([[color2]]), cv2.COLOR_BGR2HSV)[0][0]
 
-    # Calculate distances in both spaces
     rgb_dist = np.sqrt(np.sum((color1 - color2) ** 2))
 
-    # Weighted HSV distance (giving more importance to hue)
     h_dist = min(abs(hsv1[0] - hsv2[0]), 180 - abs(hsv1[0] - hsv2[0])) / 90.0
     s_dist = abs(hsv1[1] - hsv2[1]) / 255.0
     v_dist = abs(hsv1[2] - hsv2[2]) / 255.0
@@ -222,8 +216,7 @@ def calculate_clustering_accuracy(predicted_labels, true_labels):
     # Handle only team labels for accuracy calculation
     team_mask = predicted_labels != 2
     if not any(team_mask):
-        return 0.0, {'true_positive': 0, 'true_negative': 0,
-                     'false_positive': 0, 'false_negative': 0}
+        return 0.0
 
     team_predictions = predicted_labels[team_mask]
     team_true_labels = true_labels[team_mask] - 1  # Convert from 1,2 to 0,1
@@ -234,44 +227,48 @@ def calculate_clustering_accuracy(predicted_labels, true_labels):
 
     best_accuracy = max(accuracy1, accuracy2)
 
-    # Use the best mapping for confusion matrix
-    if accuracy1 >= accuracy2:
-        final_predictions = team_predictions
-    else:
-        final_predictions = 1 - team_predictions
-
-    # Calculate confusion matrix
-    confusion_matrix = {
-        'true_positive': np.sum((final_predictions == 1) & (team_true_labels == 1)),
-        'true_negative': np.sum((final_predictions == 0) & (team_true_labels == 0)),
-        'false_positive': np.sum((final_predictions == 1) & (team_true_labels == 0)),
-        'false_negative': np.sum((final_predictions == 0) & (team_true_labels == 1))
-    }
-
-    return best_accuracy, confusion_matrix
+    return best_accuracy
 
 
-def main():
-    image_path = '17.png'
-    labels_path = '17.txt'
+def update_box_classes(bounding_boxes, team_labels):
+    """
+    Update the class labels in bounding boxes based on team classification.
 
-    # Load and process image
-    original_image = cv2.imread(image_path)
+    Args:
+        bounding_boxes: Original bounding boxes with class labels
+        team_labels: Predicted team labels (0, 1, or 2 for referee)
 
-    # Parse bounding boxes and extract colors
-    bounding_boxes = parse_yolo_labels(labels_path)
-    player_colors = extract_player_colors(original_image, bounding_boxes)
+    Returns:
+        updated_boxes: New bounding boxes with updated class labels
+    """
+    updated_boxes = []
+    for box, team_label in zip(bounding_boxes, team_labels):
+        # Create a new box with updated class
+        new_class = team_label + 1  # Convert 0,1,2 to 1,2,3
+        new_box = [new_class] + list(box[1:])  # Keep original coordinates
+        updated_boxes.append(new_box)
+    return updated_boxes
 
-    # Classify players with referee detection
-    team_labels = classify_players_by_color(player_colors)
-    true_labels = np.array([box[0] for box in bounding_boxes])
 
-    # Visualize results
-    vis_image = original_image.copy()
+def save_updated_labels(filename, updated_boxes):
+    """
+    Save updated bounding boxes to a YOLO format label file.
+
+    Args:
+        filename: Output filename
+        updated_boxes: List of updated bounding boxes with new class labels
+    """
+    with open(filename, 'w') as f:
+        for box in updated_boxes:
+            # Convert box values to strings and join with spaces
+            line = ' '.join(map(str, box))
+            f.write(line + '\n')
+
+
+def visualize_results(vis_image, player_colors, team_labels):
     TEAM1_COLOR = (0, 0, 255)  # Red in BGR
     TEAM2_COLOR = (255, 0, 0)  # Blue in BGR
     REFEREE_COLOR = (0, 255, 0)  # Green in BGR
-
     for (colors, box), team_label in zip(player_colors, team_labels):
         cls, x1, x2, y1, y2 = box
 
@@ -305,16 +302,38 @@ def main():
         cv2.putText(vis_image, label_text,
                     (int(x1), int(y1) - patch_height - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
-
-    accuracy, confusion_matrix = calculate_clustering_accuracy(team_labels, true_labels)
-
-    print("\nClustering Performance Metrics:")
-    print(f"Overall Accuracy: {accuracy * 100:.2f}%")
-
-    # Display results
+        # Display results
     cv2.imshow('Team Classification with Colors', vis_image)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
+
+
+def main():
+    image_path = '15.png'
+    labels_path = '15.txt'
+
+    # Load and process image
+    original_image = cv2.imread(image_path)
+
+    # Parse bounding boxes and extract colors
+    bounding_boxes = parse_yolo_labels(labels_path)
+    player_colors = extract_player_colors(original_image, bounding_boxes)
+
+    # Classify players with referee detection
+    team_labels = classify_players_by_color(player_colors)
+    true_labels = np.array([box[0] for box in bounding_boxes])
+    updated_boxes = update_box_classes(bounding_boxes, team_labels)
+
+    # Save updated labels if needed
+    output_labels_path = 'new  '+labels_path
+    save_updated_labels(output_labels_path, updated_boxes)
+    # Visualize results
+
+    visualize_results(original_image.copy(), player_colors, team_labels)
+
+    accuracy = calculate_clustering_accuracy(team_labels, true_labels)
+
+    print(f"Overall Accuracy: {accuracy * 100:.2f}%")
 
 
 if __name__ == '__main__':
