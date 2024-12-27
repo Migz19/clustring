@@ -10,7 +10,7 @@ def parse_yolo_labels(file_path):
             parts = list(map(float, line.split()))
 
             cls, x1, x2, y1, y2 = parts
-            if cls == 1 or cls == 2 or cls == 5:
+            if (cls in range(1, 6)):
                 bounding_boxes.append([cls, x1, x2, y1, y2])
     return bounding_boxes
 
@@ -162,49 +162,55 @@ def extract_player_colors(image, bounding_boxes):
     return player_colors
 
 
-def classify_players_by_color(player_colors, n_teams=2, referee_distance_threshold=0.3):
+def classify_players_by_color(player_colors, n_teams=2, special_distance_threshold=0.3, gk_distance_threshold=0.4):
     """
-    Classify players using both dominant colors, with optional referee detection.
+    Classify players using both dominant colors, with flexible role detection.
 
     Args:
         player_colors: List of color pairs and bounding boxes
         n_teams: Number of teams (default 2)
-        referee_distance_threshold: Minimum distance threshold to consider a player as referee
+        special_distance_threshold: Threshold for referee detection
+        gk_distance_threshold: Threshold for goalkeeper detection (typically lower than referee)
     """
-    # Extract primary colors for clustering
+    # Extract and normalize color features
     primary_colors = np.array([color_pair[0][0] for color_pair in player_colors])
     secondary_colors = np.array([color_pair[0][1] for color_pair in player_colors])
-
-    # Combine color features
     color_features = np.concatenate([primary_colors, secondary_colors], axis=1)
-
-    # Normalize features
     color_features = color_features / 255.0
 
-    # First, perform clustering for all players
-    kmeans = KMeans(n_clusters=n_teams, random_state=42, n_init=10)
+    # Initial team clustering
+    kmeans = KMeans(n_clusters=n_teams, random_state=20, n_init=10)
     labels = kmeans.fit_predict(color_features)
-
-    # Get cluster centers
     team_centers = kmeans.cluster_centers_
 
-    # Calculate average distance to cluster centers for each player
+    # Calculate distances to cluster centers for each player
     distances = np.zeros(len(color_features))
     for i in range(len(color_features)):
-        # Calculate minimum distance to any team cluster
         dist_to_clusters = [np.linalg.norm(color_features[i] - center) for center in team_centers]
         distances[i] = min(dist_to_clusters)
 
-    # Find the player with maximum distance to any cluster
-    max_distance_idx = np.argmax(distances)
-    max_distance = distances[max_distance_idx]
-
-    # Create final labels: teams are 0 and 1, referee is 2
+    # Create final labels starting with team assignments
     final_labels = labels.copy()
 
-    # Only mark as referee if the distance exceeds the threshold
-    if max_distance > referee_distance_threshold:
-        final_labels[max_distance_idx] = 2  # Mark as referee
+    # Sort indices by distance
+    sorted_indices = np.argsort(distances)[::-1]  # Descending order
+
+    # First, look for referee (most distinct color)
+    if len(sorted_indices) > 0 and distances[sorted_indices[0]] > special_distance_threshold:
+        referee_idx = sorted_indices[0]
+        final_labels[referee_idx] = 3  # Referee
+        # Remove referee from consideration for goalkeeper
+        sorted_indices = sorted_indices[1:]
+
+    # Then look for potential goalkeepers among remaining players
+    gk_candidates = []
+    for idx in sorted_indices:
+        if distances[idx] > gk_distance_threshold:
+            gk_candidates.append(idx)
+
+    # Assign goalkeeper labels (up to 2)
+    for i, gk_idx in enumerate(gk_candidates[:2]):  # Limit to max 2 goalkeepers
+        final_labels[gk_idx] = 4 + i  # 4 for GK1, 5 for GK2
 
     return final_labels
 
@@ -233,19 +239,11 @@ def calculate_clustering_accuracy(predicted_labels, true_labels):
 def update_box_classes(bounding_boxes, team_labels):
     """
     Update the class labels in bounding boxes based on team classification.
-
-    Args:
-        bounding_boxes: Original bounding boxes with class labels
-        team_labels: Predicted team labels (0, 1, or 2 for referee)
-
-    Returns:
-        updated_boxes: New bounding boxes with updated class labels
     """
     updated_boxes = []
     for box, team_label in zip(bounding_boxes, team_labels):
-        # Create a new box with updated class
-        new_class = team_label + 1  # Convert 0,1,2 to 1,2,3
-        new_box = [new_class] + list(box[1:])  # Keep original coordinates
+        new_box = [team_label] if team_label > 2 else [team_label + 1]  # Keep special role numbers
+        new_box.extend(list(box[1:]))  # Keep original coordinates
         updated_boxes.append(new_box)
     return updated_boxes
 
@@ -266,51 +264,47 @@ def save_updated_labels(filename, updated_boxes):
 
 
 def visualize_results(vis_image, player_colors, team_labels):
-    TEAM1_COLOR = (0, 0, 255)  # Red in BGR
-    TEAM2_COLOR = (255, 0, 0)  # Blue in BGR
-    REFEREE_COLOR = (0, 255, 0)  # Green in BGR
-    for (colors, box), team_label in zip(player_colors, team_labels):
+    COLORS = {
+        0: (0, 0, 255),  # Team 1 - Red
+        1: (255, 0, 0),  # Team 2 - Blue
+        3: (0, 255, 0),  # Referee - Green
+        4: (255, 255, 0),  # GK1 - Cyan
+        5: (0, 255, 255)  # GK2 - Yellow
+    }
+
+    LABELS = {
+        0: "T1",
+        1: "T2",
+        3: "REF",
+        4: "GK1",
+        5: "GK2"
+    }
+
+    # Count roles for debugging
+    role_counts = {role: 0 for role in [0, 1, 3, 4, 5]}
+
+    for (color, box), team_label in zip(player_colors, team_labels):
         cls, x1, x2, y1, y2 = box
+        role_counts[team_label] += 1
 
-        # Choose color based on team label
-        if team_label == 2:  # Referee
-            box_color = REFEREE_COLOR
-            label_text = "REF"
-        else:
-            box_color = TEAM1_COLOR if team_label == 0 else TEAM2_COLOR
-            label_text = f"T {team_label + 1}"
+        box_color = COLORS[team_label]
+        label_text = f"{LABELS[team_label]} ({cls})"
 
-        # Draw bounding box
+        # Draw bounding box and label
         cv2.rectangle(vis_image, (int(x1), int(y1)), (int(x2), int(y2)),
                       box_color, 2)
-
-        # Add color patches for visualization
-        patch_width = 30
-        patch_height = 15
-        y_offset = int(y1) - patch_height - 5
-
-        # Draw patches for both colors
-        for i, color in enumerate(colors):
-            patch_x = int(x1) + (i * patch_width)
-            if y_offset > 0:
-                cv2.rectangle(vis_image,
-                              (patch_x, y_offset),
-                              (patch_x + patch_width, y_offset + patch_height),
-                              color, -1)
-
-        # Add label
         cv2.putText(vis_image, label_text,
-                    (int(x1), int(y1) - patch_height - 10),
+                    (int(x1), int(y1) - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
-        # Display results
+
     cv2.imshow('Team Classification with Colors', vis_image)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
 
 def main():
-    image_path = '15.png'
-    labels_path = '15.txt'
+    image_path = '17.png'
+    labels_path = '17.txt'
 
     # Load and process image
     original_image = cv2.imread(image_path)
@@ -325,7 +319,7 @@ def main():
     updated_boxes = update_box_classes(bounding_boxes, team_labels)
 
     # Save updated labels if needed
-    output_labels_path = 'new  '+labels_path
+    output_labels_path = 'new  ' + labels_path
     save_updated_labels(output_labels_path, updated_boxes)
     # Visualize results
 
